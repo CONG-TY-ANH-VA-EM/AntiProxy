@@ -15,6 +15,7 @@ use tracing::{debug, error, info};
 use crate::proxy::mappers::claude::{
     transform_claude_request_in, transform_response, create_claude_sse_stream, ClaudeRequest,
 };
+use crate::proxy::session_manager::SessionManager;
 use crate::proxy::server::AppState;
 use axum::http::HeaderMap;
 
@@ -32,7 +33,7 @@ const JITTER_FACTOR: f64 = 0.2;  // ±20% jitter
 
 // ===== Thinking 块处理辅助函数 =====
 
-use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent, SystemPrompt, UsageMetadata};
 
 /// 检查 thinking 块是否有有效签名
 fn has_valid_signature(block: &ContentBlock) -> bool {
@@ -845,14 +846,245 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
-/// 计算 tokens (占位符)
+const MESSAGE_OVERHEAD_TOKENS: u32 = 3;
+const IMAGE_BLOCK_TOKENS: u32 = 256;
+const DOCUMENT_BLOCK_TOKENS: u32 = 1024;
+
+fn estimate_tokens_from_text(text: &str) -> u32 {
+    let mut ascii_chars = 0u32;
+    let mut non_ascii_chars = 0u32;
+
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_chars += 1;
+        } else {
+            non_ascii_chars += 1;
+        }
+    }
+
+    let ascii_tokens = (ascii_chars + 3) / 4;
+    ascii_tokens + non_ascii_chars
+}
+
+fn estimate_tokens_from_value(value: &Value) -> u32 {
+    estimate_tokens_from_text(&value.to_string())
+}
+
+fn estimate_tokens_from_content_block(block: &ContentBlock) -> u32 {
+    match block {
+        ContentBlock::Text { text } => estimate_tokens_from_text(text),
+        ContentBlock::Thinking { thinking, .. } => estimate_tokens_from_text(thinking),
+        ContentBlock::ToolUse { name, input, .. } => {
+            estimate_tokens_from_text(name) + estimate_tokens_from_value(input)
+        }
+        ContentBlock::ToolResult { content, .. } => estimate_tokens_from_value(content),
+        ContentBlock::ServerToolUse { name, input, .. } => {
+            estimate_tokens_from_text(name) + estimate_tokens_from_value(input)
+        }
+        ContentBlock::WebSearchToolResult { content, .. } => estimate_tokens_from_value(content),
+        ContentBlock::RedactedThinking { data } => estimate_tokens_from_text(data),
+        ContentBlock::Image { .. } => IMAGE_BLOCK_TOKENS,
+        ContentBlock::Document { .. } => DOCUMENT_BLOCK_TOKENS,
+    }
+}
+
+fn estimate_tokens_from_message_content(content: &MessageContent) -> u32 {
+    match content {
+        MessageContent::String(text) => estimate_tokens_from_text(text),
+        MessageContent::Array(blocks) => blocks
+            .iter()
+            .map(estimate_tokens_from_content_block)
+            .sum(),
+    }
+}
+
+fn estimate_tokens_from_request(request: &ClaudeRequest) -> u32 {
+    let mut total = 0u32;
+
+    if let Some(system) = &request.system {
+        match system {
+            SystemPrompt::String(text) => {
+                total += estimate_tokens_from_text(text);
+            }
+            SystemPrompt::Array(blocks) => {
+                for block in blocks {
+                    total += estimate_tokens_from_text(&block.text);
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = &request.tools {
+        if let Ok(value) = serde_json::to_value(tools) {
+            total += estimate_tokens_from_value(&value);
+        }
+    }
+
+    for msg in &request.messages {
+        total += MESSAGE_OVERHEAD_TOKENS;
+        total += estimate_tokens_from_message_content(&msg.content);
+    }
+
+    total
+}
+
+fn estimate_tokens_from_gemini_body(body: &Value) -> u32 {
+    if let Some(request) = body.get("request") {
+        estimate_tokens_from_value(request)
+    } else {
+        estimate_tokens_from_value(body)
+    }
+}
+
+fn extract_total_tokens(value: &Value) -> Option<u32> {
+    let raw = value.get("response").unwrap_or(value);
+
+    let total = raw
+        .get("totalTokens")
+        .or_else(|| raw.get("total_tokens"))
+        .or_else(|| raw.get("tokenCount"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+
+    if total.is_some() {
+        return total;
+    }
+
+    let usage = raw
+        .get("usageMetadata")
+        .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
+
+    usage
+        .and_then(|u| u.prompt_token_count.or(u.total_token_count))
+}
+
+/// 计算 tokens
 pub async fn handle_count_tokens(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
+    let request: ClaudeRequest = match serde_json::from_value(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("Invalid request body: {}", e)
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let estimated_tokens = estimate_tokens_from_request(&request);
+
+    let stable_session_id = SessionManager::extract_session_id(&request);
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &request.model,
+        &*state.custom_mapping.read().await,
+        &*state.openai_mapping.read().await,
+        &*state.anthropic_mapping.read().await,
+        false,
+    );
+
+    let tools_val: Option<Vec<Value>> = request.tools.as_ref().map(|list| {
+        list.iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(json!({})))
+            .collect()
+    });
+
+    let config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &request.model,
+        &initial_mapped_model,
+        &tools_val,
+    );
+
+    let is_cli_request = config.request_type == "agent";
+    let mapped_model = if is_cli_request {
+        crate::proxy::common::model_mapping::resolve_model_route(
+            &request.model,
+            &*state.custom_mapping.read().await,
+            &*state.openai_mapping.read().await,
+            &*state.anthropic_mapping.read().await,
+            true,
+        )
+    } else {
+        initial_mapped_model
+    };
+
+    let mut request_with_mapped = request.clone();
+    request_with_mapped.model = mapped_model;
+
+    let input_tokens = match state
+        .token_manager
+        .get_token("claude", &config.request_type, false, Some(&stable_session_id))
+        .await
+    {
+        Ok(selected) => match transform_claude_request_in(&request_with_mapped, &selected.project_id) {
+            Ok(gemini_body) => {
+                let transformed_estimate =
+                    estimate_tokens_from_gemini_body(&gemini_body).max(estimated_tokens);
+                let upstream = state.upstream.clone();
+                match upstream
+                    .call_v1_internal("countTokens", &selected.access_token, gemini_body, None)
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_success() {
+                            tracing::warn!(
+                                "[Claude-CountTokens] Upstream error {}. Falling back to estimate.",
+                                status
+                            );
+                            transformed_estimate
+                        } else {
+                            match resp.json::<Value>().await {
+                                Ok(value) => {
+                                    extract_total_tokens(&value).unwrap_or(transformed_estimate)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[Claude-CountTokens] Parse error: {}. Falling back to estimate.",
+                                        e
+                                    );
+                                    transformed_estimate
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[Claude-CountTokens] Upstream call failed: {}. Falling back to estimate.",
+                            e
+                        );
+                        transformed_estimate
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[Claude-CountTokens] Transform error: {}. Falling back to estimate.",
+                    e
+                );
+                estimated_tokens
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "[Claude-CountTokens] Token error: {}. Falling back to estimate.",
+                e
+            );
+            estimated_tokens
+        }
+    };
+
     Json(json!({
-        "input_tokens": 0,
+        "input_tokens": input_tokens,
         "output_tokens": 0
     }))
     .into_response()

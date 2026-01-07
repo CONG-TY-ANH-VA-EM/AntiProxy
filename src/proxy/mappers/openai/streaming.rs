@@ -55,8 +55,13 @@ pub fn create_openai_sse_stream(
     model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
     let mut buffer = BytesMut::new();
-    
+
     let stream = async_stream::stream! {
+        // Track usage metadata from Gemini response for token counting
+        // Prefixed with _ as these are reserved for future usage reporting
+        let mut _last_prompt_tokens: u32 = 0;
+        let mut _last_completion_tokens: u32 = 0;
+
         while let Some(item) = gemini_stream.next().await {
             match item {
                 Ok(bytes) => {
@@ -92,6 +97,16 @@ pub fn create_openai_sse_stream(
                                     let candidates = actual_data.get("candidates").and_then(|c| c.as_array());
                                     let candidate = candidates.and_then(|c| c.get(0));
                                     let parts = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array());
+
+                                    // Extract usage metadata from Gemini response
+                                    if let Some(usage) = actual_data.get("usageMetadata") {
+                                        if let Some(prompt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+                                            _last_prompt_tokens = prompt as u32;
+                                        }
+                                        if let Some(completion) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+                                            _last_completion_tokens = completion as u32;
+                                        }
+                                    }
 
                                     let mut content_out = String::new();
                                     

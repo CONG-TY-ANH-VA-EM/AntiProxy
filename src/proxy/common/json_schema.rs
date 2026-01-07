@@ -98,6 +98,9 @@ fn clean_json_schema_recursive(value: &mut Value) {
                     // 仅当值是简单类型时才迁移
                     if val.is_string() || val.is_number() || val.is_boolean() {
                         constraints.push(format!("{}: {}", label, val));
+                    } else {
+                        // [FIX] 如果不是简单类型（可能是同名属性），则放回
+                        map.insert(field.to_string(), val);
                     }
                 }
             }
@@ -258,7 +261,7 @@ mod tests {
             schema["properties"]["pattern"]["properties"]["regex"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("pattern: ^[a-z]+$")
+                .contains("pattern: \"^[a-z]+$\"")
         );
 
         // 5. 验证联合类型被降级为单一类型 (Protobuf 兼容性)

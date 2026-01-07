@@ -74,6 +74,8 @@ pub fn get_supported_models() -> Vec<String> {
 }
 
 /// 动态获取所有可用模型列表 (包含内置与用户自定义)
+///
+/// 只返回核心可用模型，不包含别名和冗余变体
 pub async fn get_all_dynamic_models(
     openai_mapping: &tokio::sync::RwLock<std::collections::HashMap<String, String>>,
     custom_mapping: &tokio::sync::RwLock<std::collections::HashMap<String, String>>,
@@ -82,12 +84,29 @@ pub async fn get_all_dynamic_models(
     use std::collections::HashSet;
     let mut model_ids = HashSet::new();
 
-    // 1. 获取所有内置映射模型
-    for m in get_supported_models() {
-        model_ids.insert(m);
-    }
+    // 1. Core Claude models (only native supported, no aliases)
+    model_ids.insert("claude-opus-4-5-thinking".to_string());
+    model_ids.insert("claude-sonnet-4-5".to_string());
+    model_ids.insert("claude-sonnet-4-5-thinking".to_string());
 
-    // 2. 获取所有自定义映射模型 (OpenAI)
+    // 2. Core Gemini models
+    model_ids.insert("gemini-2.5-flash".to_string());
+    model_ids.insert("gemini-2.5-flash-lite".to_string());
+    model_ids.insert("gemini-2.5-flash-thinking".to_string());
+    model_ids.insert("gemini-2.5-pro".to_string());
+    model_ids.insert("gemini-3-flash".to_string());
+    model_ids.insert("gemini-3-pro-low".to_string());
+    model_ids.insert("gemini-3-pro-high".to_string());
+    model_ids.insert("gemini-3-pro-preview".to_string());
+    model_ids.insert("gemini-3-pro-image".to_string());
+
+    // 3. Core OpenAI models (for compatibility)
+    model_ids.insert("gpt-4".to_string());
+    model_ids.insert("gpt-4o".to_string());
+    model_ids.insert("gpt-4o-mini".to_string());
+    model_ids.insert("gpt-3.5-turbo".to_string());
+
+    // 4. Add custom mapping models (OpenAI)
     {
         let mapping = openai_mapping.read().await;
         for key in mapping.keys() {
@@ -97,7 +116,7 @@ pub async fn get_all_dynamic_models(
         }
     }
 
-    // 3. 获取所有自定义映射模型 (Custom)
+    // 5. Add custom mapping models (Custom)
     {
         let mapping = custom_mapping.read().await;
         for key in mapping.keys() {
@@ -105,7 +124,7 @@ pub async fn get_all_dynamic_models(
         }
     }
 
-    // 4. 获取所有 Anthropic 映射模型
+    // 6. Add Anthropic mapping models
     {
         let mapping = anthropic_mapping.read().await;
         for key in mapping.keys() {
@@ -114,31 +133,6 @@ pub async fn get_all_dynamic_models(
             }
         }
     }
-
-    // 5. 确保包含常用的 Gemini/画画模型 ID
-    model_ids.insert("gemini-3-pro-low".to_string());
-    
-    // [NEW] Issue #247: Dynamically generate all Image Gen Combinations
-    let base = "gemini-3-pro-image";
-    let resolutions = vec!["", "-2k", "-4k"];
-    let ratios = vec!["", "-1x1", "-4x3", "-3x4", "-16x9", "-9x16", "-21x9"];
-    
-    for res in resolutions {
-        for ratio in ratios.iter() {
-            let mut id = base.to_string();
-            id.push_str(res);
-            id.push_str(ratio);
-            model_ids.insert(id);
-        }
-    }
-
-    model_ids.insert("gemini-2.0-flash-exp".to_string());
-    model_ids.insert("gemini-2.5-flash".to_string());
-    model_ids.insert("gemini-2.5-pro".to_string());
-    model_ids.insert("gemini-3-flash".to_string());
-    model_ids.insert("gemini-3-pro-high".to_string());
-    model_ids.insert("gemini-3-pro-low".to_string());
-
 
     let mut sorted_ids: Vec<_> = model_ids.into_iter().collect();
     sorted_ids.sort();

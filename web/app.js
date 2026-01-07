@@ -484,6 +484,7 @@ function computeAccountStats(account) {
   let claudeTotal = 0;
   let geminiCount = 0;
   let claudeCount = 0;
+  let earliestResetTime = null;
 
   models.forEach((model) => {
     const name = String(model.name || "").toLowerCase();
@@ -495,6 +496,15 @@ function computeAccountStats(account) {
       claudeTotal += model.percentage || 0;
       claudeCount += 1;
     }
+    // Track earliest reset time across all models
+    if (model.reset_time) {
+      const resetDate = new Date(model.reset_time);
+      if (!isNaN(resetDate.getTime()) && resetDate > new Date()) {
+        if (!earliestResetTime || resetDate < new Date(earliestResetTime)) {
+          earliestResetTime = model.reset_time;
+        }
+      }
+    }
   });
 
   return {
@@ -502,6 +512,7 @@ function computeAccountStats(account) {
     claudeAvg: claudeCount ? Math.round(claudeTotal / claudeCount) : 0,
     geminiCount,
     claudeCount,
+    earliestResetTime,
   };
 }
 
@@ -537,21 +548,43 @@ function renderTierBadge(tier) {
 
 function renderSummary() {
   const summary = computeSummary(state.accounts);
-  const cards = [
-    { title: "Gemini", value: summary.avgGemini },
-    { title: "Claude", value: summary.avgClaude },
+  const usage = state.apiKeysTotalUsage;
+
+  // Quota cards
+  const quotaCards = [
+    { title: "Gemini", value: summary.avgGemini, type: "quota" },
+    { title: "Claude", value: summary.avgClaude, type: "quota" },
   ];
 
-  elements.summaryGrid.innerHTML = cards
+  // Token usage cards
+  const tokenCards = usage ? [
+    { title: "Input Tokens", value: usage.total_input_tokens, type: "token-input" },
+    { title: "Output Tokens", value: usage.total_output_tokens, type: "token-output" },
+  ] : [];
+
+  const allCards = [...quotaCards, ...tokenCards];
+
+  elements.summaryGrid.innerHTML = allCards
     .map(
       (card, index) => {
-        const colorClass = getQuotaColorClass(card.value);
-        return `
+        if (card.type === "quota") {
+          const colorClass = getQuotaColorClass(card.value);
+          return `
       <div class="summary-card ${colorClass}" style="animation-delay:${index * 0.05}s">
         <h3>${escapeHtml(card.title)}</h3>
         <div class="value">${card.value}%</div>
       </div>
     `;
+        } else {
+          const iconClass = card.type === "token-input" ? "icon-input" : "icon-output";
+          const colorClass = card.type === "token-input" ? "token-purple" : "token-amber";
+          return `
+      <div class="summary-card ${colorClass}" style="animation-delay:${index * 0.05}s">
+        <h3>${escapeHtml(card.title)}</h3>
+        <div class="value">${formatNumber(card.value)}</div>
+      </div>
+    `;
+        }
       }
     )
     .join("");
@@ -601,6 +634,33 @@ function renderCurrentAccount() {
     </div>
     `
     : "";
+  // API Keys usage section
+  const apiKeysHtml = state.apiKeys.length
+    ? `
+    <div class="apikeys-usage-section">
+      <div class="apikeys-usage-head">
+        <span>API Keys Usage</span>
+      </div>
+      <div class="apikeys-usage-list">
+        ${state.apiKeys
+          .map((key) => {
+            const totalTokens = (key.usage?.total_input_tokens || 0) + (key.usage?.total_output_tokens || 0);
+            return `
+              <div class="apikeys-usage-item">
+                <span class="apikeys-usage-name">${escapeHtml(key.name)}</span>
+                <div class="apikeys-usage-stats">
+                  <span class="apikeys-usage-stat">${formatNumber(key.usage?.total_requests || 0)} <small>reqs</small></span>
+                  <span class="apikeys-usage-stat">${formatNumber(totalTokens)} <small>tokens</small></span>
+                </div>
+              </div>
+            `;
+          })
+          .join("")}
+      </div>
+    </div>
+    `
+    : "";
+
   elements.currentAccountBody.innerHTML = `
     <div class="card-title">
       <strong class="truncate" title="${escapeHtml(current.email)}">${escapeHtml(current.email)}</strong>
@@ -615,6 +675,7 @@ function renderCurrentAccount() {
       ${renderMetricCard("Claude", stats.claudeAvg, stats.claudeCount)}
     </div>
     ${otherAccountsHtml}
+    ${apiKeysHtml}
   `;
 }
 
@@ -632,6 +693,7 @@ function renderAccounts() {
       const stats = computeAccountStats(account);
       const geminiColorClass = getQuotaColorClass(stats.geminiAvg);
       const claudeColorClass = getQuotaColorClass(stats.claudeAvg);
+      const resetTimeDisplay = formatTimeUntilReset(stats.earliestResetTime);
       return `
         <div class="table-row">
           <div class="table-cell" style="overflow:hidden">
@@ -647,6 +709,9 @@ function renderAccounts() {
           </div>
           <div class="table-cell">
             <span class="muted">${escapeHtml(updatedAt)}</span>
+          </div>
+          <div class="table-cell">
+            <span class="muted" title="${escapeHtml(stats.earliestResetTime || '')}">${escapeHtml(resetTimeDisplay)}</span>
           </div>
           <div class="table-cell">
             <span class="badge ${geminiColorClass}">${stats.geminiAvg}%</span>
@@ -703,6 +768,7 @@ function renderCustomMappingList() {
       ([source, target]) => `
       <div class="mapping-row">
         <code>${escapeHtml(source)}</code>
+        <span class="mapping-arrow">→</span>
         <code>${escapeHtml(target)}</code>
         <button class="ghost small" data-remove-mapping="${escapeHtml(source)}" type="button">Remove</button>
       </div>
@@ -1100,6 +1166,8 @@ async function loadApiKeys() {
     state.apiKeysTotalUsage = usage || null;
     renderApiKeysList();
     renderApiKeysUsageSummary();
+    renderSummary(); // Update overview summary with token usage
+    renderCurrentAccount(); // Update current account with API key usage
   } catch (err) {
     console.error("Failed to load API keys:", err);
   }
@@ -1148,6 +1216,36 @@ function formatTimestamp(ts) {
   return date.toLocaleDateString();
 }
 
+/**
+ * Format time until quota reset
+ * @param {string} resetTimeStr - ISO 8601 timestamp string (e.g., "2025-01-08T12:00:00Z")
+ * @returns {string} - Human-readable time until reset (e.g., "2h 30m", "45m", "5d 3h")
+ */
+function formatTimeUntilReset(resetTimeStr) {
+  if (!resetTimeStr) return "-";
+
+  const resetTime = new Date(resetTimeStr);
+  const now = new Date();
+  const diffMs = resetTime - now;
+
+  // If already reset or invalid
+  if (diffMs <= 0 || isNaN(diffMs)) return "-";
+
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffDays > 0) {
+    const remainingHours = Math.floor((diffMs % 86400000) / 3600000);
+    return `${diffDays}d ${remainingHours}h`;
+  }
+  if (diffHours > 0) {
+    const remainingMins = Math.floor((diffMs % 3600000) / 60000);
+    return `${diffHours}h ${remainingMins}m`;
+  }
+  return `${diffMins}m`;
+}
+
 function renderApiKeysUsageSummary() {
   if (!elements.apiKeysUsageSummary) return;
   const usage = state.apiKeysTotalUsage;
@@ -1160,21 +1258,39 @@ function renderApiKeysUsageSummary() {
     ? ((usage.success_count / usage.total_requests) * 100).toFixed(1)
     : 0;
 
+  // SVG Icons for each card
+  const iconRequests = `<svg class="summary-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>`;
+  const iconSuccess = `<svg class="summary-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
+  const iconInput = `<svg class="summary-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
+  const iconOutput = `<svg class="summary-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 11 12 6 7 11"/><polyline points="17 18 12 13 7 18"/></svg>`;
+
   elements.apiKeysUsageSummary.innerHTML = `
     <div class="summary-card">
-      <div class="summary-label">Total Requests</div>
+      <div class="summary-header">
+        ${iconRequests}
+        <div class="summary-label">Total Requests</div>
+      </div>
       <div class="summary-value">${formatNumber(usage.total_requests)}</div>
     </div>
     <div class="summary-card">
-      <div class="summary-label">Success Rate</div>
+      <div class="summary-header">
+        ${iconSuccess}
+        <div class="summary-label">Success Rate</div>
+      </div>
       <div class="summary-value">${successRate}%</div>
     </div>
     <div class="summary-card">
-      <div class="summary-label">Input Tokens</div>
+      <div class="summary-header">
+        ${iconInput}
+        <div class="summary-label">Input Tokens</div>
+      </div>
       <div class="summary-value">${formatNumber(usage.total_input_tokens)}</div>
     </div>
     <div class="summary-card">
-      <div class="summary-label">Output Tokens</div>
+      <div class="summary-header">
+        ${iconOutput}
+        <div class="summary-label">Output Tokens</div>
+      </div>
       <div class="summary-value">${formatNumber(usage.total_output_tokens)}</div>
     </div>
   `;

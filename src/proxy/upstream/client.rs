@@ -1,22 +1,21 @@
-// 上游客户端实现
-// 基于高性能通讯接口封装
+// Upstream client implementation
+// High-performance HTTP client wrapper
 
 use reqwest::{header, Client, Response, StatusCode};
 use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
-// Cloud Code v1internal endpoints (fallback order: prod → daily)
-// 优先使用稳定的 prod 端点，避免影响缓存命中率
+// Cloud Code v1internal endpoints (default priority: prod → daily)
 const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
-const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 2] = [
-    V1_INTERNAL_BASE_URL_PROD,   // 优先使用生产环境（稳定）
-    V1_INTERNAL_BASE_URL_DAILY,  // 备用测试环境（新功能）
-];
 
 pub struct UpstreamClient {
     http_client: Client,
     user_agent: String,
+    // Dynamic endpoint priority list - successful fallback gets promoted
+    endpoints: Arc<RwLock<Vec<String>>>,
 }
 
 impl UpstreamClient {
@@ -28,11 +27,11 @@ impl UpstreamClient {
             .unwrap_or_else(|| "antigravity/1.11.9 windows/amd64".to_string());
 
         let mut builder = Client::builder()
-            // Connection settings (优化连接复用，减少建立开销)
+            // Connection settings (optimize connection reuse, reduce overhead)
             .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(16)                  // 每主机最多 16 个空闲连接
-            .pool_idle_timeout(Duration::from_secs(90))  // 空闲连接保持 90 秒
-            .tcp_keepalive(Duration::from_secs(60))      // TCP 保活探测 60 秒
+            .pool_max_idle_per_host(16)                  // Max 16 idle connections per host
+            .pool_idle_timeout(Duration::from_secs(90))  // Keep idle connections for 90s
+            .tcp_keepalive(Duration::from_secs(60))      // TCP keepalive probe at 60s
             .timeout(Duration::from_secs(600))
             .user_agent(&user_agent);
 
@@ -51,7 +50,31 @@ impl UpstreamClient {
 
         let http_client = builder.build().expect("Failed to create HTTP client");
 
-        Self { http_client, user_agent }
+        // Initialize with default endpoint priority
+        let endpoints = Arc::new(RwLock::new(vec![
+            V1_INTERNAL_BASE_URL_PROD.to_string(),
+            V1_INTERNAL_BASE_URL_DAILY.to_string(),
+        ]));
+
+        Self { http_client, user_agent, endpoints }
+    }
+
+    /// Promote a successful fallback endpoint to primary position
+    async fn promote_endpoint(&self, successful_idx: usize) {
+        if successful_idx == 0 {
+            return; // Already primary
+        }
+
+        let mut endpoints = self.endpoints.write().await;
+        if successful_idx < endpoints.len() {
+            let endpoint = endpoints.remove(successful_idx);
+            endpoints.insert(0, endpoint.clone());
+            tracing::info!(
+                "⚡ Endpoint promoted to primary: {} (was fallback #{})",
+                endpoint,
+                successful_idx
+            );
+        }
     }
 
     /// 构建 v1internal URL
@@ -80,8 +103,9 @@ impl UpstreamClient {
     }
 
     /// 调用 v1internal API（基础方法）
-    /// 
+    ///
     /// 发起基础网络请求，支持多端点自动 Fallback
+    /// 当 fallback 端点成功时，会自动将其提升为主端点
     pub async fn call_v1_internal(
         &self,
         method: &str,
@@ -108,10 +132,14 @@ impl UpstreamClient {
 
         let mut last_err: Option<String> = None;
 
+        // Read current endpoint priority (dynamic, may have been promoted)
+        let endpoints = self.endpoints.read().await.clone();
+        let endpoint_count = endpoints.len();
+
         // 遍历所有端点，失败时自动切换
-        for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+        for (idx, base_url) in endpoints.iter().enumerate() {
             let url = Self::build_url(base_url, method, query_string);
-            let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
+            let has_next = idx + 1 < endpoint_count;
 
             let response = self
                 .http_client
@@ -131,8 +159,10 @@ impl UpstreamClient {
                                 base_url,
                                 status,
                                 idx + 1,
-                                V1_INTERNAL_BASE_URL_FALLBACKS.len()
+                                endpoint_count
                             );
+                            // Promote successful fallback to primary position
+                            self.promote_endpoint(idx).await;
                         } else {
                             tracing::debug!("✓ Upstream request succeeded | Endpoint: {} | Status: {}", base_url, status);
                         }
@@ -191,8 +221,9 @@ impl UpstreamClient {
     // 已移除弃用的辅助方法 (parse_duration_ms)
 
     /// 获取可用模型列表
-    /// 
+    ///
     /// 获取远端模型列表，支持多端点自动 Fallback
+    /// 当 fallback 端点成功时，会自动将其提升为主端点
     pub async fn fetch_available_models(&self, access_token: &str) -> Result<Value, String> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
@@ -212,8 +243,12 @@ impl UpstreamClient {
 
         let mut last_err: Option<String> = None;
 
+        // Read current endpoint priority (dynamic, may have been promoted)
+        let endpoints = self.endpoints.read().await.clone();
+        let endpoint_count = endpoints.len();
+
         // 遍历所有端点，失败时自动切换
-        for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+        for (idx, base_url) in endpoints.iter().enumerate() {
             let url = Self::build_url(base_url, "fetchAvailableModels", None);
 
             let response = self
@@ -234,6 +269,8 @@ impl UpstreamClient {
                                 base_url,
                                 status
                             );
+                            // Promote successful fallback to primary position
+                            self.promote_endpoint(idx).await;
                         } else {
                             tracing::debug!("✓ fetchAvailableModels succeeded | Endpoint: {}", base_url);
                         }
@@ -245,7 +282,7 @@ impl UpstreamClient {
                     }
 
                     // 如果有下一个端点且当前错误可重试，则切换
-                    let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
+                    let has_next = idx + 1 < endpoint_count;
                     if has_next && Self::should_try_next_endpoint(status) {
                         tracing::warn!(
                             "fetchAvailableModels returned {} at {}, trying next endpoint",
@@ -265,7 +302,7 @@ impl UpstreamClient {
                     last_err = Some(msg);
 
                     // 如果是最后一个端点，退出循环
-                    if idx + 1 >= V1_INTERNAL_BASE_URL_FALLBACKS.len() {
+                    if idx + 1 >= endpoint_count {
                         break;
                     }
                     continue;

@@ -13,8 +13,8 @@ pub fn to_claude_usage(usage_metadata: &super::models::UsageMetadata) -> super::
     let cached_tokens = usage_metadata.cached_content_token_count.unwrap_or(0);
     
     super::models::Usage {
-        // input_tokens 应该排除缓存的部分
-        input_tokens: prompt_tokens.saturating_sub(cached_tokens),
+        // input_tokens 应该包含缓存部分,用于准确展示上下文占用
+        input_tokens: prompt_tokens,
         output_tokens: usage_metadata.candidates_token_count.unwrap_or(0),
         // 缓存统计
         cache_read_input_tokens: if cached_tokens > 0 { Some(cached_tokens) } else { None },

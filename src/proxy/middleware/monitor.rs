@@ -37,25 +37,138 @@ pub async fn monitor_middleware(
         }
     }
 
-    if !state.monitor.is_enabled() {
+    // We need to track API key usage even if monitor is disabled
+    // So we always need to parse the response for token info when we have an authenticated API key
+    let need_token_tracking = is_api_request && authenticated_key.is_some();
+
+    if !state.monitor.is_enabled() && !need_token_tracking {
+        // Monitor disabled and no API key tracking needed - just pass through
+        return next.run(request).await;
+    }
+
+    if !state.monitor.is_enabled() && need_token_tracking {
+        // Monitor disabled but we need to track API key usage
+        // We need to parse the response to extract token info
         let response = next.run(request).await;
-        // Even if monitor is disabled, we still need to record API key usage stats
-        if is_api_request {
-            if let Some(auth_key) = authenticated_key {
-                let success = response.status().is_success();
+        let auth_key = authenticated_key.unwrap(); // Safe because need_token_tracking requires it
+        let success = response.status().is_success();
+        let status = response.status().as_u16();
+
+        let content_type = response.headers().get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("text/event-stream") {
+            // For streaming responses, we need to buffer and scan for usage
+            let (parts, body) = response.into_parts();
+            let mut stream = body.into_data_stream();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+            let auth_key_clone = auth_key.clone();
+
+            tokio::spawn(async move {
+                let mut last_few_bytes = Vec::new();
+                const TAIL_BUFFER_SIZE: usize = 16384;
+
+                while let Some(chunk_res) = stream.next().await {
+                    if let Ok(chunk) = chunk_res {
+                        last_few_bytes.extend_from_slice(&chunk);
+                        if last_few_bytes.len() > TAIL_BUFFER_SIZE {
+                            let drain_count = last_few_bytes.len() - TAIL_BUFFER_SIZE;
+                            last_few_bytes.drain(0..drain_count);
+                        }
+                        let _ = tx.send(Ok::<_, axum::Error>(chunk)).await;
+                    } else if let Err(e) = chunk_res {
+                        let _ = tx.send(Err(axum::Error::new(e))).await;
+                    }
+                }
+
+                // Extract token info from stream tail
+                let mut input_tokens = None;
+                let mut output_tokens = None;
+
+                if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
+                    for line in full_tail.lines().rev() {
+                        if line.starts_with("data: ") && line.contains("\"usage\"") {
+                            let json_str = line.trim_start_matches("data: ").trim();
+                            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                                if let Some(usage) = json.get("usage") {
+                                    input_tokens = usage.get("prompt_tokens").or(usage.get("input_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
+                                    output_tokens = usage.get("completion_tokens").or(usage.get("output_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
+                                    tracing::debug!(
+                                        "[Monitor-Lite] Extracted tokens from SSE: input={:?}, output={:?}",
+                                        input_tokens,
+                                        output_tokens
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Record API key usage
+                let stream_success = status < 400;
                 tracing::info!(
-                    "[Monitor] Recording usage for key: {}... success={}, path={}",
-                    &auth_key.key.chars().take(12).collect::<String>(),
-                    success,
-                    uri
+                    "[Monitor-Lite-SSE] Recording API key usage: key={}..., success={}, input={:?}, output={:?}",
+                    &auth_key_clone.key.chars().take(12).collect::<String>(),
+                    stream_success,
+                    input_tokens,
+                    output_tokens
                 );
-                match crate::modules::api_keys::record_usage(&auth_key.key, success, None, None) {
-                    Ok(_) => tracing::debug!("[Monitor] Usage recorded successfully"),
-                    Err(e) => tracing::error!("[Monitor] Failed to record usage: {}", e),
+                let _ = crate::modules::api_keys::record_usage(
+                    &auth_key_clone.key,
+                    stream_success,
+                    input_tokens,
+                    output_tokens,
+                );
+            });
+
+            return Response::from_parts(parts, Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        } else if content_type.contains("application/json") || content_type.contains("text/") {
+            // For JSON responses, parse the body
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, 512 * 1024).await {
+                Ok(bytes) => {
+                    let mut input_tokens = None;
+                    let mut output_tokens = None;
+
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        if let Ok(json) = serde_json::from_str::<Value>(&s) {
+                            if let Some(usage) = json.get("usage") {
+                                input_tokens = usage.get("prompt_tokens").or(usage.get("input_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
+                                output_tokens = usage.get("completion_tokens").or(usage.get("output_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        "[Monitor-Lite-JSON] Recording API key usage: key={}..., success={}, input={:?}, output={:?}",
+                        &auth_key.key.chars().take(12).collect::<String>(),
+                        success,
+                        input_tokens,
+                        output_tokens
+                    );
+                    let _ = crate::modules::api_keys::record_usage(&auth_key.key, success, input_tokens, output_tokens);
+
+                    return Response::from_parts(parts, Body::from(bytes));
+                }
+                Err(_) => {
+                    let _ = crate::modules::api_keys::record_usage(&auth_key.key, false, None, None);
+                    return Response::from_parts(parts, Body::empty());
                 }
             }
+        } else {
+            // Other content types - just record without token info
+            tracing::info!(
+                "[Monitor-Lite] Recording usage (no token info): key={}..., success={}",
+                &auth_key.key.chars().take(12).collect::<String>(),
+                success
+            );
+            let _ = crate::modules::api_keys::record_usage(&auth_key.key, success, None, None);
+            return response;
         }
-        return response;
     }
 
     let start = Instant::now();
@@ -138,15 +251,15 @@ pub async fn monitor_middleware(
 
         tokio::spawn(async move {
             let mut last_few_bytes = Vec::new();
+            const TAIL_BUFFER_SIZE: usize = 16384; // Increase buffer size to capture usage data
+
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
-                    if chunk.len() > 8192 {
-                        last_few_bytes = chunk.slice(chunk.len()-8192..).to_vec();
-                    } else {
-                        last_few_bytes.extend_from_slice(&chunk);
-                        if last_few_bytes.len() > 8192 {
-                            last_few_bytes.drain(0..last_few_bytes.len()-8192);
-                        }
+                    // Always append to buffer, then trim from front if too large
+                    last_few_bytes.extend_from_slice(&chunk);
+                    if last_few_bytes.len() > TAIL_BUFFER_SIZE {
+                        let drain_count = last_few_bytes.len() - TAIL_BUFFER_SIZE;
+                        last_few_bytes.drain(0..drain_count);
                     }
                     let _ = tx.send(Ok::<_, axum::Error>(chunk)).await;
                 } else if let Err(e) = chunk_res {
@@ -155,20 +268,42 @@ pub async fn monitor_middleware(
             }
 
             if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
+                tracing::debug!(
+                    "[Monitor] Scanning SSE tail for usage. Tail length: {} bytes",
+                    full_tail.len()
+                );
+                let mut found_usage = false;
                 for line in full_tail.lines().rev() {
                     if line.starts_with("data: ") && line.contains("\"usage\"") {
                         let json_str = line.trim_start_matches("data: ").trim();
+                        tracing::debug!("[Monitor] Found data line with usage: {}", &json_str[..json_str.len().min(200)]);
                         if let Ok(json) = serde_json::from_str::<Value>(json_str) {
                             if let Some(usage) = json.get("usage") {
+                                tracing::debug!(
+                                    "[Monitor] Found usage in SSE stream: {:?}",
+                                    usage
+                                );
                                 log.input_tokens = usage.get("prompt_tokens").or(usage.get("input_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
                                 log.output_tokens = usage.get("completion_tokens").or(usage.get("output_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
                                 if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                     log.output_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
                                 }
+                                tracing::debug!(
+                                    "[Monitor] Extracted tokens: input={:?}, output={:?}",
+                                    log.input_tokens,
+                                    log.output_tokens
+                                );
+                                found_usage = true;
                                 break;
                             }
+                        } else {
+                            tracing::warn!("[Monitor] Failed to parse JSON from data line");
                         }
                     }
+                }
+                if !found_usage {
+                    tracing::debug!("[Monitor] No usage found in SSE tail. Last 500 chars: {}",
+                        &full_tail[full_tail.len().saturating_sub(500)..]);
                 }
             }
 
@@ -180,6 +315,13 @@ pub async fn monitor_middleware(
             if is_api_request {
                 if let Some(auth_key) = auth_key_for_spawn {
                     let success = log.status < 400;
+                    tracing::info!(
+                        "[Monitor-SSE] Recording API key usage: key={}..., success={}, input={:?}, output={:?}",
+                        &auth_key.key.chars().take(12).collect::<String>(),
+                        success,
+                        log.input_tokens,
+                        log.output_tokens
+                    );
                     let _ = crate::modules::api_keys::record_usage(
                         &auth_key.key,
                         success,
@@ -220,6 +362,13 @@ pub async fn monitor_middleware(
                 if is_api_request {
                     if let Some(auth_key) = authenticated_key.clone() {
                         let success = log.status < 400;
+                        tracing::info!(
+                            "[Monitor-JSON] Recording API key usage: key={}..., success={}, input={:?}, output={:?}",
+                            &auth_key.key.chars().take(12).collect::<String>(),
+                            success,
+                            log.input_tokens,
+                            log.output_tokens
+                        );
                         let _ = crate::modules::api_keys::record_usage(
                             &auth_key.key,
                             success,
