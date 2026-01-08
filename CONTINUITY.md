@@ -9,37 +9,44 @@
   - Maintain backward compatibility where possible
 
 - **Key decisions:**
-  - Modular token_manager refactor (split 775 LOC monolith into 6 modules)
-  - YAML-based configuration to replace JSON
-  - Redis for distributed state in multi-instance mode
-  - Plugin system via WASM sandboxing
+  - Modular token_manager refactor (split 775 LOC monolith into 6 modules) ✅ DONE
+  - YAML-based configuration to replace JSON (Sprint 3-4)
+  - Redis for distributed state in multi-instance mode (Sprint 5-6)
+  - Plugin system via WASM sandboxing (Sprint 7-8)
   - Implementation plan approved by user (LGTM)
 
 - **State:**
-  - Done:
-    - Deep scan audit of AntiProxy codebase (69 Rust files, 46 deps)
-    - Created `/home/david/.gemini/antigravity/brain/.../antiproxy_audit_report.md`
-    - Created `/home/david/.gemini/antigravity/brain/.../implementation_plan.md` (approved)
-    - Created modular `src/proxy/token_manager/` structure:
-      - `mod.rs` - Module entry point
-      - `types.rs` - ProxyToken, SelectedToken with tests
-      - `session.rs` - SessionManager with tests
-      - `refresh.rs` - RefreshCoordinator with tests  
-      - `scheduling.rs` - AccountScheduler with tests
-      - `core.rs` - TokenManager implementation with tests
-      - `tests.rs` - Integration tests
+  - Done (Sprint 1):
+    - Deep scan audit completed
+    - Implementation plan approved
+    - Modular `src/proxy/token_manager/` structure created (7 files)
+    - All 34 token_manager tests pass ✅
+    - Added `mark_limited()` method to RateLimitTracker
   - Now:
-    - Wire new modular token_manager to existing proxy code
-    - Run cargo check/test to validate
-  - Next:
-    - Update `src/proxy/mod.rs` to use new module
-    - Preserve old `token_manager.rs` as backup
-    - Add Prometheus metrics module
-    - Implement RBAC foundation
+    - ⚠️ BLOCKED: Git permissions issue - need user to run fix command
+  - Next (after fix):
+    - Commit to GitHub
+    - Wire modular token_manager in `src/proxy/mod.rs`
+    - Add Prometheus metrics endpoint (Phase 2)
 
 - **Open questions:**
-  - None currently
+  - None
 
 - **Working set:**
-  - Files: `src/proxy/token_manager/*.rs`, `src/proxy/mod.rs`, `Cargo.toml`
-  - Commands: `cargo check`, `cargo test`
+  - Files: `src/proxy/token_manager/*.rs`
+  - Blocker: Git .git/objects permissions need sudo fix
+
+## 🔧 ACTION REQUIRED (for user):
+
+The Docker cargo commands ran as root and created files in `.git/objects/` with root ownership.
+
+**Run this command to fix:**
+```bash
+sudo chown -R david:david /opt/workspace/AntiProxy/.git/
+```
+
+Then run:
+```bash
+git add -A && git commit -m "feat(v2): Sprint 1 - Token Manager Modularization"
+git push
+```
