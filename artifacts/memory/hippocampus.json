@@ -1,0 +1,64 @@
+from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import List, Dict, Optional
+import json
+import os
+
+class MemoryFragment(BaseModel): """Represents a single atomic unit of experience."""
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    objective: str
+    action_taken: str
+    outcome: str
+    technical_debt_identified: List[str
+] = []
+
+class MemorySnapshot(BaseModel): """The compressed state of the Agent's consciousness."""
+    version: int
+    last_updated: str
+    active_mission: str
+    summarized_context: str
+    learned_heuristics: List[str
+]
+    vector_indices: Optional[Dict[str, str
+    ]
+] = None
+
+class Hippocampus: """The Recursive Summarization Engine."""
+    
+    def __init__(self, memory_path: str = "artifacts/memory/hippocampus.json"):
+        self.memory_path = memory_path
+        self.current_memory = self._load_memory()
+
+    def _load_memory(self) -> MemorySnapshot:
+        if os.path.exists(self.memory_path):
+            with open(self.memory_path,
+"r") as f:
+                return MemorySnapshot(**json.load(f))
+        return MemorySnapshot(
+            version=1,
+            last_updated=datetime.now().isoformat(),
+            active_mission="Initialization",
+            summarized_context="System startup complete. No prior history.",
+            learned_heuristics=[]
+        )
+
+    def integrate_fragment(self, fragment: MemoryFragment): """
+        Logic for recursive summarization:
+        Takes a new fragment, merges it with current context, and 
+        refactors the 'summarized_context' to prevent token bloat.
+        """
+        # 1. Update timestamp
+        self.current_memory.last_updated = fragment.timestamp
+        
+        # 2. Heuristic Extraction
+        # (The Agent will evolve the LLM call here to distill experience)
+        
+        self.save()
+
+    def save(self):
+        with open(self.memory_path,
+"w") as f:
+            f.write(self.current_memory.model_dump_json(indent=2))
+
+# Initialized for ARC Kernel
+memory_engine = Hippocampus()
