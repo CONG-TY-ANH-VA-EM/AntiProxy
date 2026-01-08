@@ -369,12 +369,25 @@ impl RateLimitTracker {
         self.limits.remove(&key).is_some()
     }
     
-    /// 清除所有限流记录
+    /// Clear all rate limit records
     #[allow(dead_code)]
     pub fn clear_all(&self) {
         let count = self.limits.len();
         self.limits.clear();
         tracing::debug!("清除了所有 {} 条限流记录", count);
+    }
+
+    /// Mark an account as rate limited for a specific duration (for testing)
+    #[allow(dead_code)]
+    pub fn mark_limited(&self, quota_group: &str, account_id: &str, seconds: u64) {
+        let key = self.make_key(quota_group, account_id);
+        let info = RateLimitInfo {
+            reset_time: SystemTime::now() + Duration::from_secs(seconds),
+            retry_after_sec: seconds,
+            detected_at: SystemTime::now(),
+            reason: RateLimitReason::RateLimitExceeded,
+        };
+        self.limits.insert(key, info);
     }
 }
 
